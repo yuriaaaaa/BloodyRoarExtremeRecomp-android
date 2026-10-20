@@ -1,4 +1,5 @@
 // Native Vulkan backend for XboxXBE-Recomp
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -7,8 +8,21 @@
 #endif
 #include <windows.h>
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
+// the functions are loaded at run time (vulkan-1.dll, libvulkan.so)
+#define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#ifdef _WIN32
 #include <dxgiformat.h>
+#else
+#include <dlfcn.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#include <glslang/Public/ShaderLang.h>
+#include <glslang/Public/ResourceLimits.h>
+#include <glslang/SPIRV/GlslangToSpv.h>
+#include "compat/dxgiformat.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -26,9 +40,14 @@
 #include <unordered_map>
 #include <vector>
 
+#define IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 #include <imgui.h>
 #include <backends/imgui_impl_vulkan.h>
+#ifdef _WIN32
 #include <backends/imgui_impl_win32.h>
+#else
+#include <backends/imgui_impl_sdl3.h>
+#endif
 
 #include "app/app.h"
 #include "core/log.h"
@@ -39,6 +58,7 @@
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
+#ifdef _WIN32
 #include <wrl/client.h>
 #include <unknwn.h>
 #if defined(__clang__)
@@ -49,7 +69,6 @@
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
-
 #ifdef __MINGW32__
 template<> inline const GUID &__mingw_uuidof<IDxcUtils>() {
     static const GUID id = { 0x4605c4cb, 0x2019, 0x492a, { 0xad, 0xa4, 0x65, 0xf2, 0x0b, 0xb7, 0xd6, 0x7f } };
@@ -81,9 +100,17 @@ template<> inline const GUID &__mingw_uuidof<IDxcOperationResult>() {
 }
 #endif
 
+#endif  // _WIN32
+
 namespace gpu {
 
 namespace {
+
+// the d3d12 backend's helper, which this build leaves out
+uint32_t SimpleState(const State& s, uint32_t method) { return s.simple[method >> 2]; }
+// NV2A methods this SDK's state.h does not name
+constexpr uint32_t kMDepthTestEnable = 0x30C;
+constexpr uint32_t kMStencilTestEnable = 0x32C;
 
 // Dynamic Vulkan loader
 #define VK_EXPORTED_FUNCTION(fn) PFN_##fn fn = nullptr;
@@ -108,7 +135,9 @@ VK_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceSupportKHR)
 VK_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
 VK_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceFormatsKHR)
 VK_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfacePresentModesKHR)
+#ifdef _WIN32
 VK_INSTANCE_FUNCTION(vkCreateWin32SurfaceKHR)
+#endif
 VK_INSTANCE_FUNCTION(vkGetPhysicalDeviceFormatProperties)
 
 VK_DEVICE_FUNCTION(vkDestroyDevice)
@@ -189,6 +218,7 @@ VK_DEVICE_FUNCTION(vkUpdateDescriptorSets)
 VK_DEVICE_FUNCTION(vkCreateSampler)
 VK_DEVICE_FUNCTION(vkDestroySampler)
 
+#ifdef _WIN32
 HMODULE g_vulkan_dll = nullptr;
 
 bool LoadVulkanGlobal() {
@@ -200,6 +230,21 @@ bool LoadVulkanGlobal() {
     }
     vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)GetProcAddress(g_vulkan_dll, "vkGetInstanceProcAddr");
     if (!vkGetInstanceProcAddr) return false;
+#else
+void* g_vulkan_dll = nullptr;
+
+bool LoadVulkanGlobal() {
+    if (g_vulkan_dll) return true;
+    // SDL loaded the same library for the window's surface: ask it first, the driver it picked is the one in use
+    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
+    g_vulkan_dll = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    if (!vkGetInstanceProcAddr && g_vulkan_dll)
+        vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(g_vulkan_dll, "vkGetInstanceProcAddr");
+    if (!vkGetInstanceProcAddr) {
+        LOGE("vulkan: libvulkan.so has no vkGetInstanceProcAddr");
+        return false;
+    }
+#endif
 
     vkCreateInstance = (PFN_vkCreateInstance)vkGetInstanceProcAddr(nullptr, "vkCreateInstance");
     vkEnumerateInstanceExtensionProperties = (PFN_vkEnumerateInstanceExtensionProperties)vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceExtensionProperties");
@@ -221,7 +266,9 @@ void LoadVulkanInstance(VkInstance instance) {
     LOAD_INST(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
     LOAD_INST(vkGetPhysicalDeviceSurfaceFormatsKHR);
     LOAD_INST(vkGetPhysicalDeviceSurfacePresentModesKHR);
+#ifdef _WIN32
     LOAD_INST(vkCreateWin32SurfaceKHR);
+#endif
     LOAD_INST(vkGetPhysicalDeviceFormatProperties);
 #undef LOAD_INST
 }
@@ -308,6 +355,7 @@ void LoadVulkanDevice(VkDevice device) {
 #undef LOAD_DEV
 }
 
+#ifdef _WIN32
 class DxcCompiler {
 public:
     DxcCompiler() = default;
@@ -407,6 +455,66 @@ private:
     IDxcUtils* utils_ = nullptr;
     IDxcCompiler3* compiler_ = nullptr;
 };
+
+#else
+// HLSL to SPIR-V with glslang's HLSL front end and the SPIRV-Tools legalisation DXC also runs; the arguments follow
+// the DXC ones above: b0/b1 at bindings 0/1, t at 10, s at 20, SV_Position.w as Direct3D has it
+class DxcCompiler {
+public:
+    DxcCompiler() = default;
+    ~DxcCompiler() {
+        if (ready_) glslang::FinalizeProcess();
+    }
+
+    bool Init() {
+        ready_ = glslang::InitializeProcess();
+        LOGR("vulkan: glslang HLSL compiler %s", ready_ ? "initialized" : "failed to start");
+        return ready_;
+    }
+
+    std::vector<uint32_t> Compile(const std::string& hlsl, const wchar_t*, const wchar_t* profile) {
+        if (!ready_) return {};
+        const EShLanguage stage = profile[0] == L'v' ? EShLangVertex : EShLangFragment;
+        glslang::TShader shader(stage);
+        const char* text = hlsl.c_str();
+        const int length = int(hlsl.size());
+        shader.setStringsWithLengths(&text, &length, 1);
+        shader.setEntryPoint("main");
+        shader.setSourceEntryPoint("main");
+        shader.setEnvInput(glslang::EShSourceHlsl, stage, glslang::EShClientVulkan, 100);
+        shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_1);
+        shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
+        shader.setHlslIoMapping(true);
+        shader.setAutoMapLocations(true);
+        shader.setShiftBinding(glslang::EResUbo, 0);
+        shader.setShiftBinding(glslang::EResTexture, 10);
+        shader.setShiftBinding(glslang::EResSampler, 20);
+        shader.setDxPositionW(true);
+        const auto messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules | EShMsgReadHlsl | EShMsgHlslOffsets);
+        if (!shader.parse(GetResources(), 100, false, messages)) {
+            LOGR("vulkan: shader compilation error: %s", shader.getInfoLog());
+            return {};
+        }
+        glslang::TProgram program;
+        program.addShader(&shader);
+        if (!program.link(messages) || !program.mapIO()) {
+            LOGR("vulkan: shader link error: %s", program.getInfoLog());
+            return {};
+        }
+        std::vector<uint32_t> spirv;
+        glslang::SpvOptions options;
+        options.disableOptimizer = false;  // the legalisation passes: textures and samplers handed to functions
+        options.validate = false;
+        glslang::GlslangToSpv(*program.getIntermediate(stage), spirv, &options);
+        return spirv;
+    }
+
+private:
+    static const TBuiltInResource* GetResources() { return GetDefaultResources(); }
+
+    bool ready_ = false;
+};
+#endif  // _WIN32
 
 struct VulkanTarget {
     VkImage image = VK_NULL_HANDLE;
@@ -718,6 +826,73 @@ inline VkSamplerAddressMode VkAddress(uint32_t a) {
     }
 }
 
+// BC1-3 blocks to BGRA8 for GPUs without textureCompressionBC
+void DecodeBcToBgra(Host host, uint32_t w, uint32_t h, const uint8_t* blocks, std::vector<uint8_t>& out) {
+    const uint32_t bw = std::max(1u, (w + 3) / 4), bh = std::max(1u, (h + 3) / 4);
+    const uint32_t bsize = host == Host::BC1 ? 8 : 16;
+    out.assign(size_t(w) * h * 4, 0);
+    auto expand = [](uint16_t c, uint8_t rgb[3]) {
+        rgb[0] = uint8_t(((c >> 11) & 31) * 255 / 31);
+        rgb[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
+        rgb[2] = uint8_t((c & 31) * 255 / 31);
+    };
+    for (uint32_t by = 0; by < bh; by++) {
+        for (uint32_t bx = 0; bx < bw; bx++) {
+            const uint8_t* b = blocks + (size_t(by) * bw + bx) * bsize;
+            const uint8_t* cb = host == Host::BC1 ? b : b + 8;
+            uint16_t c0 = uint16_t(cb[0] | cb[1] << 8), c1 = uint16_t(cb[2] | cb[3] << 8);
+            uint8_t pal[4][4];  // r g b a
+            expand(c0, pal[0]);
+            expand(c1, pal[1]);
+            pal[0][3] = pal[1][3] = pal[2][3] = pal[3][3] = 255;
+            if (host != Host::BC1 || c0 > c1) {
+                for (int k = 0; k < 3; k++) {
+                    pal[2][k] = uint8_t((2 * pal[0][k] + pal[1][k]) / 3);
+                    pal[3][k] = uint8_t((pal[0][k] + 2 * pal[1][k]) / 3);
+                }
+            } else {
+                for (int k = 0; k < 3; k++) {
+                    pal[2][k] = uint8_t((pal[0][k] + pal[1][k]) / 2);
+                    pal[3][k] = 0;
+                }
+                pal[3][3] = 0;
+            }
+            uint32_t idx = uint32_t(cb[4] | cb[5] << 8 | cb[6] << 16 | uint32_t(cb[7]) << 24);
+            uint8_t alpha[16];
+            if (host == Host::BC2) {
+                for (int i = 0; i < 16; i++) alpha[i] = uint8_t(((b[i / 2] >> ((i & 1) * 4)) & 15) * 17);
+            } else if (host == Host::BC3) {
+                uint8_t a[8] = {b[0], b[1]};
+                if (a[0] > a[1]) {
+                    for (int i = 1; i < 7; i++) a[i + 1] = uint8_t(((7 - i) * a[0] + i * a[1]) / 7);
+                } else {
+                    for (int i = 1; i < 5; i++) a[i + 1] = uint8_t(((5 - i) * a[0] + i * a[1]) / 5);
+                    a[6] = 0;
+                    a[7] = 255;
+                }
+                uint64_t bits = 0;
+                for (int i = 0; i < 6; i++) bits |= uint64_t(b[2 + i]) << (8 * i);
+                for (int i = 0; i < 16; i++) alpha[i] = a[(bits >> (3 * i)) & 7];
+            }
+            for (uint32_t py = 0; py < 4; py++) {
+                uint32_t y = by * 4 + py;
+                if (y >= h) break;
+                for (uint32_t px = 0; px < 4; px++) {
+                    uint32_t x = bx * 4 + px;
+                    if (x >= w) break;
+                    uint32_t i = py * 4 + px;
+                    const uint8_t* c = pal[(idx >> (2 * i)) & 3];
+                    uint8_t* o = &out[(size_t(y) * w + x) * 4];
+                    o[0] = c[2];
+                    o[1] = c[1];
+                    o[2] = c[0];
+                    o[3] = host == Host::BC1 ? c[3] : alpha[i];
+                }
+            }
+        }
+    }
+}
+
 inline VkFormat HostToVkFormat(Host h) {
     switch (h) {
         case Host::BGRA8: return VK_FORMAT_B8G8R8A8_UNORM;
@@ -748,6 +923,7 @@ public:
     void SyncLate(uint32_t data_va) override {}
     void Flush() override;
     void SetGamma(const uint8_t* ramp) override;
+    void SetOverlay(const uint8_t* bgra, uint32_t w, uint32_t h, const int32_t* dst) override;
 
 private:
     bool CreateInstance();
@@ -762,12 +938,14 @@ private:
     bool InitImGui();
     void Cleanup();
     void RecreateSwapchain();
+    bool RecreateSurface();
     void ApplySettings();
 
     uint32_t FindMemoryType(uint32_t filter, VkMemoryPropertyFlags props);
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    bool bc_supported_ = true;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
@@ -819,6 +997,17 @@ private:
     void BeginFrame();
     bool EnsureStagingBuffer(size_t size);
     bool EnsureFrontImage(uint32_t w, uint32_t h);
+    bool CreateColorImage(uint32_t w, uint32_t h, VkImage& image, VkDeviceMemory& memory);
+    // the movie overlay, drawn over the frame in the swapchain image (TRANSFER_DST) inside the display rect
+    void DrawOverlay(VkCommandBuffer cb, float vx, float vy, float vw, float vh);
+    std::vector<uint8_t> overlay_px_;
+    uint32_t overlay_w_ = 0, overlay_h_ = 0;
+    int32_t overlay_dst_[4] = {};
+    bool overlay_dirty_ = false;
+    VkImage overlay_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory overlay_memory_ = VK_NULL_HANDLE;
+    uint32_t overlay_image_w_ = 0, overlay_image_h_ = 0;
+    static constexpr size_t kOverlayStagingOffset = 8u << 20;  // past the front buffer upload
     void TransitionImageLayout(VkCommandBuffer cb, VkImage image,
                                VkImageLayout old_layout, VkImageLayout new_layout,
                                VkImageAspectFlags aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT);
@@ -960,6 +1149,8 @@ private:
         uint32_t depth_func = 0;
         uint32_t stencil_en = 0;
         uint32_t has_depth = 0;
+        int32_t zbias = 0;  // polygon offset (ZBias): depth units and slope
+        float zslope = 0;
         uint32_t element_formats[16] = {};
         uint32_t element_buffers[16] = {};
         uint32_t element_offsets[16] = {};
@@ -1020,6 +1211,88 @@ bool VulkanBackend::EnsureStagingBuffer(size_t size) {
     if (vkAllocateMemory(device_, &mai, nullptr, &staging_memory_) != VK_SUCCESS) return false;
     vkBindBufferMemory(device_, staging_buffer_, staging_memory_, 0);
     return vkMapMemory(device_, staging_memory_, 0, staging_size_, 0, &staging_mapped_) == VK_SUCCESS;
+}
+
+bool VulkanBackend::CreateColorImage(uint32_t w, uint32_t h, VkImage& image, VkDeviceMemory& memory) {
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_B8G8R8A8_UNORM;
+    ici.extent = {w, h, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(device_, &ici, nullptr, &image) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(device_, image, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device_, &mai, nullptr, &memory) != VK_SUCCESS) return false;
+    return vkBindImageMemory(device_, image, memory, 0) == VK_SUCCESS;
+}
+
+void VulkanBackend::SetOverlay(const uint8_t* bgra, uint32_t w, uint32_t h, const int32_t* dst) {
+    overlay_w_ = bgra ? w : 0;
+    overlay_h_ = bgra ? h : 0;
+    if (!overlay_w_ || !overlay_h_) return;
+    overlay_px_.assign(bgra, bgra + size_t(w) * h * 4);
+    std::memcpy(overlay_dst_, dst, sizeof(overlay_dst_));
+    overlay_dirty_ = true;
+}
+
+void VulkanBackend::DrawOverlay(VkCommandBuffer cb, float vx, float vy, float vw, float vh) {
+    uint32_t w = overlay_w_, h = overlay_h_;
+    if (!w || !h) return;
+    size_t bytes = size_t(w) * h * 4;
+    if (overlay_image_ && (overlay_image_w_ != w || overlay_image_h_ != h)) {
+        vkDeviceWaitIdle(device_);
+        vkDestroyImage(device_, overlay_image_, nullptr);
+        vkFreeMemory(device_, overlay_memory_, nullptr);
+        overlay_image_ = VK_NULL_HANDLE;
+        overlay_memory_ = VK_NULL_HANDLE;
+    }
+    if (!overlay_image_) {
+        if (!CreateColorImage(w, h, overlay_image_, overlay_memory_)) {
+            overlay_image_ = VK_NULL_HANDLE;
+            overlay_w_ = 0;
+            return;
+        }
+        overlay_image_w_ = w;
+        overlay_image_h_ = h;
+        overlay_dirty_ = true;
+    }
+    if (overlay_dirty_) {
+        if (!EnsureStagingBuffer(kOverlayStagingOffset + bytes)) return;
+        std::memcpy(static_cast<uint8_t*>(staging_mapped_) + kOverlayStagingOffset, overlay_px_.data(), bytes);
+        TransitionImageLayout(cb, overlay_image_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.bufferOffset = kOverlayStagingOffset;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cb, staging_buffer_, overlay_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        TransitionImageLayout(cb, overlay_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        overlay_dirty_ = false;
+    }
+    // dst is in the title's display coordinates (guest_w_ x guest_h_)
+    float sx = vw / float(guest_w_ ? guest_w_ : 640), sy = vh / float(guest_h_ ? guest_h_ : 480);
+    int32_t x0 = int32_t(vx + overlay_dst_[0] * sx), y0 = int32_t(vy + overlay_dst_[1] * sy);
+    int32_t x1 = int32_t(vx + overlay_dst_[2] * sx), y1 = int32_t(vy + overlay_dst_[3] * sy);
+    int32_t ew = int32_t(swapchain_extent_.width), eh = int32_t(swapchain_extent_.height);
+    x0 = std::clamp(x0, 0, ew), x1 = std::clamp(x1, 0, ew), y0 = std::clamp(y0, 0, eh), y1 = std::clamp(y1, 0, eh);
+    if (x1 <= x0 || y1 <= y0) return;
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {int32_t(w), int32_t(h), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[0] = {x0, y0, 0};
+    blit.dstOffsets[1] = {x1, y1, 1};
+    vkCmdBlitImage(cb, overlay_image_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain_images_[image_index_],
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 }
 
 bool VulkanBackend::EnsureFrontImage(uint32_t w, uint32_t h) {
@@ -1341,20 +1614,36 @@ void VulkanBackend::SaveCachesAsync() {
 
 bool VulkanBackend::CreateInstance() {
     VkApplicationInfo app_info{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    #ifdef _WIN32
     app_info.pApplicationName = "Bloody Roar Extreme Recomp";
+#else
+    app_info.pApplicationName = "Primal Fury";
+#endif
     app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     app_info.pEngineName = "XboxXBE-Recomp Vulkan";
     app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     app_info.apiVersion = VK_API_VERSION_1_2;
 
+#ifdef _WIN32
     const char* extensions[] = {
         VK_KHR_SURFACE_EXTENSION_NAME,
         VK_KHR_WIN32_SURFACE_EXTENSION_NAME
     };
+    uint32_t ext_count = static_cast<uint32_t>(std::size(extensions));
+#else
+    // the surface extensions SDL needs for its window (VK_KHR_surface + VK_KHR_android_surface)
+    Uint32 ext_count = 0;
+    const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&ext_count);
+    if (!extensions) {
+        LOGE("vulkan: SDL_Vulkan_GetInstanceExtensions failed: %s", SDL_GetError());
+        return false;
+    }
+    app_info.apiVersion = VK_API_VERSION_1_1;
+#endif
 
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app_info;
-    ci.enabledExtensionCount = static_cast<uint32_t>(std::size(extensions));
+    ci.enabledExtensionCount = ext_count;
     ci.ppEnabledExtensionNames = extensions;
 
     VkResult res = vkCreateInstance(&ci, nullptr, &instance_);
@@ -1367,6 +1656,15 @@ bool VulkanBackend::CreateInstance() {
 }
 
 bool VulkanBackend::CreateSurface() {
+#ifndef _WIN32
+    auto* window = static_cast<SDL_Window*>(app::Window());
+    if (!window || !SDL_Vulkan_CreateSurface(window, instance_, nullptr, &surface_)) {
+        LOGW("vulkan: SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+        return false;
+    }
+    LOGR("vulkan: surface created for the SDL window");
+    return true;
+#else
     HWND hwnd = static_cast<HWND>(app::Window());
     if (!hwnd) {
         LOGR("vulkan: app::Window() returned null hwnd");
@@ -1382,6 +1680,7 @@ bool VulkanBackend::CreateSurface() {
     }
     LOGR("vulkan: surface created for HWND %p", hwnd);
     return true;
+#endif
 }
 
 bool VulkanBackend::PickPhysicalDevice() {
@@ -1447,7 +1746,18 @@ bool VulkanBackend::CreateDevice() {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME
     };
 
+    VkPhysicalDeviceFeatures have{};
+    vkGetPhysicalDeviceFeatures(physical_device_, &have);
+    VkPhysicalDeviceFeatures feats{};
+    feats.textureCompressionBC = have.textureCompressionBC;
+    feats.samplerAnisotropy = have.samplerAnisotropy;
+    feats.fillModeNonSolid = have.fillModeNonSolid;
+    feats.depthClamp = have.depthClamp;
+    bc_supported_ = have.textureCompressionBC == VK_TRUE;
+    LOGR("vulkan: BC textures %s", bc_supported_ ? "on the GPU" : "decoded on the CPU");
+
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.pEnabledFeatures = &feats;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = static_cast<uint32_t>(std::size(dev_extensions));
@@ -1469,6 +1779,15 @@ bool VulkanBackend::CreateSwapchain() {
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device_, surface_, &caps);
 
     swapchain_extent_ = caps.currentExtent;
+#ifndef _WIN32
+    if (swapchain_extent_.width == UINT32_MAX || swapchain_extent_.width == 0) {
+        int pw = 0, ph = 0;
+        if (SDL_GetWindowSizeInPixels(static_cast<SDL_Window*>(app::Window()), &pw, &ph) && pw > 0 && ph > 0) {
+            swapchain_extent_.width = uint32_t(pw);
+            swapchain_extent_.height = uint32_t(ph);
+        }
+    }
+#endif
     if (swapchain_extent_.width == UINT32_MAX || swapchain_extent_.width == 0) {
         swapchain_extent_.width = guest_w_ ? guest_w_ : 1280;
     }
@@ -1508,8 +1827,16 @@ bool VulkanBackend::CreateSwapchain() {
     sci.imageArrayLayers = 1;
     sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    sci.preTransform = caps.currentTransform;
+    sci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+                           ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    for (VkCompositeAlphaFlagBitsKHR ca : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+                                           VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR}) {
+        if (caps.supportedCompositeAlpha & ca) {
+            sci.compositeAlpha = ca;
+            break;
+        }
+    }
     VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
     if (!app::Get().vsync) {
         uint32_t pm_count = 0;
@@ -2169,6 +2496,12 @@ VulkanBackend::VulkanTexture* VulkanBackend::GetOrCreateTexture(const State& s, 
     if (px.empty()) return nullptr;
 
     VkFormat vk_fmt = HostToVkFormat(fi.host);
+    if (!bc_supported_ && (fi.host == Host::BC1 || fi.host == Host::BC2 || fi.host == Host::BC3)) {
+        std::vector<uint8_t> rgba;
+        DecodeBcToBgra(fi.host, d.width, d.height, px.data(), rgba);
+        px.swap(rgba);
+        vk_fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    }
 
     if (!same) {
         if (it != textures_.end()) {
@@ -2451,6 +2784,11 @@ VkPipeline VulkanBackend::GetOrCreatePipeline(const State& s, const Assembled& a
         k.depth_write = SimpleState(s, kMZWriteEnable) != 0 ? 1 : 0;
         k.depth_func = SimpleState(s, kMZFunc) ? SimpleState(s, kMZFunc) : 4;
         k.stencil_en = (SimpleState(s, kMStencilTestEnable) != 0 || s.rs[kRsStencilEnable] != 0) ? 1 : 0;
+        // polygon offset as the D3D12 backend takes it: bias in 24 bit depth units, slope per console pixel
+        if (a.topology == Topology::Triangles && SimpleState(s, kMSolidOffsetEnable)) {
+            k.zbias = int32_t(std::lround(Bits(SimpleState(s, kMDepthOffset)) * 16777215.0f / s.zscale));
+            k.zslope = Bits(SimpleState(s, kMSlopeScale)) * scale_;
+        }
     }
 
     for (int r = 0; r < 16; r++) {
@@ -2521,6 +2859,11 @@ VkPipeline VulkanBackend::GetOrCreatePipeline(const State& s, const Assembled& a
     rs.cullMode = cull_en ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     rs.frontFace = cull_cw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
     rs.lineWidth = 1.0f;
+    if (k.zbias || k.zslope != 0) {
+        rs.depthBiasEnable = VK_TRUE;
+        rs.depthBiasConstantFactor = float(k.zbias);
+        rs.depthBiasSlopeFactor = k.zslope;
+    }
 
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -2747,19 +3090,22 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
 
     // 5. Constants
     // VC (b0)
-    static uint64_t s_last_vsc_epoch = 0;
+    static decltype(s.vsc) s_last_vsc{};
     static uint32_t s_last_vsc_offset = 0;
     static uint32_t s_last_vsc_frame = 0xFFFFFFFF;
+    static uint64_t s_last_vsc_pres = ~0ull;
     uint32_t vc_offset = 0;
-    if (s_last_vsc_epoch == s.vsc_epoch && s_last_vsc_frame == current_frame_) {
+    if (s_last_vsc_frame == current_frame_ && s_last_vsc_pres == pres_count_ &&
+        !std::memcmp(s_last_vsc.data(), s.vsc.data(), sizeof(s.vsc))) {
         vc_offset = s_last_vsc_offset;
     } else {
         DynamicAlloc vc_alloc = AllocDynamic(sizeof(s.vsc), min_uniform_alignment_);
         std::memcpy(vc_alloc.host_ptr, s.vsc.data(), sizeof(s.vsc));
         vc_offset = vc_alloc.offset;
-        s_last_vsc_epoch = s.vsc_epoch;
+        s_last_vsc = s.vsc;
         s_last_vsc_offset = vc_offset;
         s_last_vsc_frame = current_frame_;
+        s_last_vsc_pres = pres_count_;
     }
 
     // DC (b1)
@@ -2890,6 +3236,20 @@ void VulkanBackend::Present(const Surface& front) {
     static uint64_t pres_count = 0;
     pres_count_ = ++pres_count;
 
+#ifndef _WIN32
+    // Android takes the window away while the app is in the background or covered by the settings:
+    // hold the frame until it is back, then present to the new window
+    if (g_paused.load(std::memory_order_acquire) || g_surface_lost.exchange(false, std::memory_order_relaxed)) {
+        LOGI("vulkan: the window is gone, holding frames until it is back");
+        vkDeviceWaitIdle(device_);
+        for (;;) {
+            while (g_paused.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (RecreateSurface()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+#endif
+
     BeginFrame();
     VkCommandBuffer cb = command_buffers_[current_frame_];
     if (active_rp_ != VK_NULL_HANDLE) {
@@ -2905,6 +3265,7 @@ void VulkanBackend::Present(const Surface& front) {
         res = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, image_available_sem_[current_frame_],
                                     VK_NULL_HANDLE, &image_index_);
     }
+    if (res == VK_ERROR_SURFACE_LOST_KHR) g_surface_lost.store(true, std::memory_order_relaxed);
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
         // drop the frame but leave the frame fence signalled: the next BeginFrame waits on it
         vkEndCommandBuffer(cb);
@@ -2949,6 +3310,10 @@ void VulkanBackend::Present(const Surface& front) {
         float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
         float sw = float(swapchain_extent_.width);
         float sh = float(swapchain_extent_.height);
+#ifdef __ANDROID__
+        aspect = app::DisplayAspect();
+        if (aspect <= 0.0f) aspect = sw / sh;
+#endif
         float vw = std::min(sw, sh * aspect);
         float vh = vw / aspect;
         int32_t vx = int32_t((sw - vw) / 2.0f);
@@ -2965,6 +3330,7 @@ void VulkanBackend::Present(const Surface& front) {
         vkCmdBlitImage(cb, t.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        swapchain_images_[image_index_], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &blit, VK_FILTER_LINEAR);
+        DrawOverlay(cb, float(vx), float(vy), vw, vh);
 
         TransitionImageLayout(cb, swapchain_images_[image_index_], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         has_image = true;
@@ -3037,6 +3403,10 @@ void VulkanBackend::Present(const Surface& front) {
                 float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
                 float sw = float(swapchain_extent_.width);
                 float sh = float(swapchain_extent_.height);
+#ifdef __ANDROID__
+                aspect = app::DisplayAspect();
+                if (aspect <= 0.0f) aspect = sw / sh;
+#endif
                 float vw = std::min(sw, sh * aspect);
                 float vh = vw / aspect;
                 int32_t vx = int32_t((sw - vw) / 2.0f);
@@ -3053,6 +3423,7 @@ void VulkanBackend::Present(const Surface& front) {
                 vkCmdBlitImage(cb, front_image_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                swapchain_images_[image_index_], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                1, &blit, VK_FILTER_LINEAR);
+                DrawOverlay(cb, float(vx), float(vy), vw, vh);
 
                 TransitionImageLayout(cb, swapchain_images_[image_index_], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                 has_image = true;
@@ -3069,6 +3440,16 @@ void VulkanBackend::Present(const Surface& front) {
         srr.levelCount = 1;
         srr.layerCount = 1;
         vkCmdClearColorImage(cb, swapchain_images_[image_index_], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black_clear, 1, &srr);
+        if (overlay_w_) {
+            float sw = float(swapchain_extent_.width), sh = float(swapchain_extent_.height);
+            float aspect = app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
+#ifdef __ANDROID__
+            aspect = app::DisplayAspect();
+            if (aspect <= 0.0f) aspect = sw / sh;
+#endif
+            float vw = std::min(sw, sh * aspect), vh = vw / aspect;
+            DrawOverlay(cb, (sw - vw) / 2.0f, (sh - vh) / 2.0f, vw, vh);
+        }
         TransitionImageLayout(cb, swapchain_images_[image_index_], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
 
@@ -3086,7 +3467,11 @@ void VulkanBackend::Present(const Surface& front) {
     {
         std::lock_guard lock(app::UiLock());
         ImGui_ImplVulkan_NewFrame();
+#ifdef _WIN32
         ImGui_ImplWin32_NewFrame();
+#else
+        ImGui_ImplSDL3_NewFrame();
+#endif
         ImGui::NewFrame();
         if (app::kGame.ui) app::kGame.ui(fps_);
         ImGui::Render();
@@ -3118,7 +3503,9 @@ void VulkanBackend::Present(const Surface& front) {
     pi.pSwapchains = &swapchain_;
     pi.pImageIndices = &image_index_;
 
-    vkQueuePresentKHR(queue_, &pi);
+    VkResult pres = vkQueuePresentKHR(queue_, &pi);
+    if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) g_window_resized.store(true, std::memory_order_relaxed);
+    if (pres == VK_ERROR_SURFACE_LOST_KHR) g_surface_lost.store(true, std::memory_order_relaxed);
     CountFps();
     ApplySettings();
 
@@ -3177,6 +3564,26 @@ void VulkanBackend::Flush() {
 
 void VulkanBackend::SetGamma(const uint8_t* ramp) {
     std::memcpy(ramp_, ramp, sizeof(ramp_));
+}
+
+bool VulkanBackend::RecreateSurface() {
+    if (!device_) return true;
+    vkDeviceWaitIdle(device_);
+    for (auto fb : framebuffers_) vkDestroyFramebuffer(device_, fb, nullptr);
+    framebuffers_.clear();
+    for (auto iv : swapchain_views_) vkDestroyImageView(device_, iv, nullptr);
+    swapchain_views_.clear();
+    if (swapchain_) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+    swapchain_ = VK_NULL_HANDLE;
+    if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
+    surface_ = VK_NULL_HANDLE;
+    if (!CreateSurface()) return false;  // no window yet
+    VkBool32 ok = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(physical_device_, queue_family_, surface_, &ok);
+    if (!CreateSwapchain()) return false;
+    CreateFramebuffers();
+    LOGI("vulkan: window back, swapchain %ux%u%s", swapchain_extent_.width, swapchain_extent_.height, ok ? "" : " (no present support?)");
+    return true;
 }
 
 void VulkanBackend::RecreateSwapchain() {
@@ -3299,6 +3706,10 @@ void VulkanBackend::Cleanup() {
             vkDestroyImage(device_, front_image_, nullptr);
             front_image_ = VK_NULL_HANDLE;
         }
+        if (overlay_image_) vkDestroyImage(device_, overlay_image_, nullptr);
+        if (overlay_memory_) vkFreeMemory(device_, overlay_memory_, nullptr);
+        overlay_image_ = VK_NULL_HANDLE;
+        overlay_memory_ = VK_NULL_HANDLE;
         if (front_image_memory_) {
             vkFreeMemory(device_, front_image_memory_, nullptr);
             front_image_memory_ = VK_NULL_HANDLE;
@@ -3330,5 +3741,10 @@ std::unique_ptr<Backend> CreateVulkanBackend() {
     auto b = std::make_unique<VulkanBackend>();
     return b;
 }
+
+#ifndef _WIN32
+// the SDK's d3d8 device asks for the platform backend by this name; Android has only Vulkan
+std::unique_ptr<Backend> CreateBackend() { return CreateVulkanBackend(); }
+#endif
 
 }  // namespace gpu
