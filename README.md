@@ -17,6 +17,9 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 
 ---
 
+> [!NOTE]
+> This fork adds an Android (arm64) build named Primal Fury. See [android/README.md](android/README.md).
+
 ## Game & ISO Requirements
 
 To install or compile this port, you must provide your own copy from a legally owned Xbox disc:
